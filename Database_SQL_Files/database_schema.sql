@@ -1,12 +1,24 @@
+/*
+	 ______       _     _                ____  ____  
+	|__  (_) __ _(_)___| |_ _ __ _   _  |  _ \| __ ) 
+	  / /| |/ _` | / __| __| '__| | | | | | | |  _ \ 
+	 / /_| | (_| | \__ \ |_| |  | |_| | | |_| | |_) |
+	/____|_|\__, |_|___/\__|_|   \__, | |____/|____/ 
+            |___/                |___/               
+
+            Zigistry's Database schema V2
+*/
+
 CREATE TABLE users (
   id VARCHAR(45) PRIMARY KEY COLLATE NOCASE,
   avatar_id VARCHAR(65) NOT NULL,
-  -- This will now be either gh for GitHub or cb for Codeberg.
-  platform VARCHAR(2) NOT NULL COLLATE NOCASE,
+  -- This is the id of the platform like gh or cb.
+  platform_id VARCHAR(2) NOT NULL COLLATE NOCASE,
   bio VARCHAR(260)
 );
 
-CREATE INDEX idx_users_platform ON users (platform);
+CREATE INDEX idx_users_platform_id ON users (platform_id);
+
 
 CREATE TABLE repos (
   -- The username is 40 characters at max, repo name is 100 and the key and slashes is 5
@@ -15,7 +27,7 @@ CREATE TABLE repos (
   -- 40 + the key and the slash i.e 3, so I think best is 45 for htis.
   owner VARCHAR(45) NOT NULL COLLATE NOCASE,
   -- GH CB like, 2 characters
-  platform VARCHAR(2) NOT NULL COLLATE NOCASE,
+  platform_id VARCHAR(2) NOT NULL COLLATE NOCASE,
   -- This has afaik, 255, hence, 260
   description VARCHAR(260),
   issues_count INTEGER NOT NULL DEFAULT 0,
@@ -41,9 +53,15 @@ CREATE TABLE repos (
   last_updated_in_this_database INTEGER NOT NULL,
   -- Because the search results are getting too much overload, 
   -- I am trying to make this extremley read intensive.
+  is_package BOOLEAN NOT NULL DEFAULT 0 CHECK (is_package IN (0, 1)),
+  is_program BOOLEAN NOT NULL DEFAULT 0 CHECK (is_program IN (0, 1)),
   latest_release_version VARCHAR(255),
+  dependents_count INTEGER NOT NULL DEFAULT 0,
+  owner_avatar_id VARCHAR(65),
+  minimum_zig_version VARCHAR(30),
   FOREIGN KEY (owner) REFERENCES users (id) ON DELETE CASCADE
 );
+
 
 CREATE VIRTUAL TABLE repo_search USING fts5 (
     repo_id UNINDEXED,                           -- e.g. "gh/zigzap/zap"
@@ -60,7 +78,7 @@ CREATE TABLE repo_topics (
   -- Limit is 50, hence
   topic VARCHAR(60) NOT NULL COLLATE NOCASE,
   PRIMARY KEY (repo_id, topic),
-  FOREIGN KEY (repo_id) REFERENCES repos (id) ON DELETE CASCADE,
+  FOREIGN KEY (repo_id) REFERENCES repos (id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_topics_topic ON repo_topics (topic, repo_id);
@@ -140,3 +158,33 @@ CREATE TABLE banned_repos (
     reason TEXT
 );
 
+-- packages
+CREATE INDEX idx_repos_pkg_stars ON repos (
+    is_disabled, is_package, stargazer_count DESC, id ASC
+);
+CREATE INDEX idx_repos_pkg_dependents ON repos (
+    is_disabled, is_package, dependents_count DESC, id ASC
+);
+CREATE INDEX idx_repos_pkg_pushed ON repos (
+    is_disabled, is_package, pushed_at DESC, id ASC
+);
+CREATE INDEX idx_repos_pkg_created ON repos (
+    is_disabled, is_package, created_at DESC, id ASC
+);
+-- programs
+CREATE INDEX idx_repos_prog_stars ON repos (
+    is_disabled, is_program, stargazer_count DESC, id ASC
+);
+CREATE INDEX idx_repos_prog_dependents ON repos (
+    is_disabled, is_program, dependents_count DESC, id ASC
+);
+CREATE INDEX idx_repos_prog_pushed ON repos (
+    is_disabled, is_program, pushed_at DESC, id ASC
+);
+CREATE INDEX idx_repos_prog_created ON repos (
+    is_disabled, is_program, created_at DESC, id ASC
+);
+-- users
+CREATE INDEX idx_repos_owner_stars ON repos (
+    owner, is_disabled, stargazer_count DESC
+);
