@@ -4,7 +4,7 @@
 	  / /| |/ _` | / __| __| '__| | | | | | | |  _ \ 
 	 / /_| | (_| | \__ \ |_| |  | |_| | | |_| | |_) |
 	/____|_|\__, |_|___/\__|_|   \__, | |____/|____/ 
-            |___/                |___/               
+          |___/                |___/               
 
             Zigistry's Database schema V2
 */
@@ -16,9 +16,6 @@ CREATE TABLE users (
   platform_id VARCHAR(2) NOT NULL COLLATE NOCASE,
   bio VARCHAR(260)
 );
-
-CREATE INDEX idx_users_platform_id ON users (platform_id);
-
 
 CREATE TABLE repos (
   -- The username is 40 characters at max, repo name is 100 and the key and slashes is 5
@@ -62,7 +59,6 @@ CREATE TABLE repos (
   FOREIGN KEY (owner) REFERENCES users (id) ON DELETE CASCADE
 );
 
-
 CREATE VIRTUAL TABLE repo_search USING fts5 (
     repo_id UNINDEXED,                           -- e.g. "gh/zigzap/zap"
     keywords,
@@ -80,8 +76,6 @@ CREATE TABLE repo_topics (
   PRIMARY KEY (repo_id, topic),
   FOREIGN KEY (repo_id) REFERENCES repos (id) ON DELETE CASCADE
 ) WITHOUT ROWID;
-
-CREATE INDEX idx_topics_topic ON repo_topics (topic, repo_id);
 
 CREATE TABLE repo_dependents (
     repo_id VARCHAR(150) NOT NULL COLLATE NOCASE,
@@ -101,8 +95,6 @@ CREATE TABLE releases (
     PRIMARY KEY (repo_id, version),
     FOREIGN KEY (repo_id) REFERENCES repos (id) ON DELETE CASCADE
 ) WITHOUT ROWID;
-
-CREATE INDEX idx_releases_repo_publish ON releases (repo_id, published_at DESC);
 
 CREATE TABLE release_dependencies (
     repo_id VARCHAR(150) NOT NULL COLLATE NOCASE,
@@ -135,11 +127,6 @@ CREATE TABLE repo_pipeline_queue (
     processed_at INTEGER
 );
 
-
-
-
-CREATE INDEX idx_pipeline_status ON repo_pipeline_queue (status, queued_at);
-
 -- These are only the users who are either spamming or
 -- shipping malware.
 CREATE TABLE banned_users (
@@ -158,33 +145,3 @@ CREATE TABLE banned_repos (
     reason TEXT
 );
 
--- packages
-CREATE INDEX idx_repos_pkg_stars ON repos (
-    is_disabled, is_package, stargazer_count DESC, id ASC
-);
-CREATE INDEX idx_repos_pkg_dependents ON repos (
-    is_disabled, is_package, dependents_count DESC, id ASC
-);
-CREATE INDEX idx_repos_pkg_pushed ON repos (
-    is_disabled, is_package, pushed_at DESC, id ASC
-);
-CREATE INDEX idx_repos_pkg_created ON repos (
-    is_disabled, is_package, created_at DESC, id ASC
-);
--- programs
-CREATE INDEX idx_repos_prog_stars ON repos (
-    is_disabled, is_program, stargazer_count DESC, id ASC
-);
-CREATE INDEX idx_repos_prog_dependents ON repos (
-    is_disabled, is_program, dependents_count DESC, id ASC
-);
-CREATE INDEX idx_repos_prog_pushed ON repos (
-    is_disabled, is_program, pushed_at DESC, id ASC
-);
-CREATE INDEX idx_repos_prog_created ON repos (
-    is_disabled, is_program, created_at DESC, id ASC
-);
--- users
-CREATE INDEX idx_repos_owner_stars ON repos (
-    owner, is_disabled, stargazer_count DESC
-);

@@ -5,7 +5,7 @@ use crate::bzz_stuff::{parse, tokenize};
 use crate::constants::limits;
 use crate::constants::{ASYNC_LIMIT, GH_GRAPH_QL_PARTIAL_QUERY, GH_GRAPH_QL_QUERY};
 use crate::database::{
-    parse_lazy_flag, truncate_option_to_char_limit, truncate_to_char_limit, utc_now_timestamp,
+    parse_lazy_flag, truncate_option_to_char_limit, truncate_to_char_limit,
 };
 use crate::github::github_data::{ReleaseData, RepoData};
 use crate::github::types::{DefaultBranchRef, Node};
@@ -18,6 +18,19 @@ use libsql::{Connection, Transaction, params};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn parse_iso_to_epoch(date_str: &str) -> i64 {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(date_str) {
+        return dt.timestamp();
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%SZ") {
+        return naive.and_utc().timestamp();
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S") {
+        return naive.and_utc().timestamp();
+    }
+    0
+}
 
 const EMPTY_REPLY: &str =
     r#"{"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}"#;
@@ -283,13 +296,13 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
         readme_content,
         build_zig_zon_version,
         build_zig_zon_dependencies,
-        default_branch_directory_files,
+        default_branch_directory_files: _,
         releases,
     } = data;
 
     let repo_id = truncate_to_char_limit(&repo_id, limits::REPO_ID_MAX_LEN);
     let user_id = truncate_to_char_limit(&user_id, limits::USER_ID_MAX_LEN);
-    let platform = truncate_to_char_limit("github", limits::PLATFORM_MAX_LEN);
+    let platform_id = "gh";
     let avatar_id = truncate_to_char_limit(&repository.owner.login, limits::USER_AVATAR_ID_MAX_LEN);
     let owner_id = truncate_to_char_limit(&user_id, limits::REPO_OWNER_MAX_LEN);
     let user_bio =
@@ -328,30 +341,50 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
             .unwrap_or("-"),
         limits::REPO_PRIMARY_LANGUAGE_MAX_LEN,
     );
-    let database_updated_at = utc_now_timestamp();
+    let database_updated_at = chrono::Utc::now().timestamp();
+    let pushed_at_epoch = parse_iso_to_epoch(&repository.pushed_at);
+    let created_at_epoch = parse_iso_to_epoch(&repository.created_at);
+
+    let latest_release = releases.iter().find(|r| !r.is_prerelease).or_else(|| releases.first());
+    let latest_release_version = latest_release.map(|r| {
+        truncate_to_char_limit(&r.tag_name, limits::RELEASE_VERSION_MAX_LEN)
+    });
+    let min_zig_ver_candidate = latest_release
+        .map(|r| r.minimum_zig_version.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(build_zig_zon_version.as_str());
+    let minimum_zig_version = if min_zig_ver_candidate.is_empty() {
+        None
+    } else {
+        Some(truncate_to_char_limit(min_zig_ver_candidate, limits::RELEASE_MIN_ZIG_VERSION_MAX_LEN))
+    };
+    let owner_avatar_id = Some(avatar_id.clone());
+    let is_package_flag = if is_package { 1i64 } else { 0i64 };
+    let is_program_flag = if !is_package { 1i64 } else { 0i64 };
 
     let (user_insert_result, repo_insert_result) = tokio::join!(
         transaction.execute(
             r#"
-            INSERT INTO users (id, platform, avatar_id, bio)
+            INSERT INTO users (id, platform_id, avatar_id, bio)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                platform = excluded.platform,
+                platform_id = excluded.platform_id,
                 avatar_id = excluded.avatar_id,
                 bio = excluded.bio
             "#,
-            params![user_id.clone(), platform.clone(), avatar_id, user_bio],
+            params![user_id.clone(), platform_id, avatar_id.clone(), user_bio],
         ),
         transaction.execute(
             r#"
             INSERT INTO repos
-                (id, owner, platform, description, issues_count, default_branch_name, fork_count,
+                (id, owner, platform_id, description, issues_count, default_branch_name, fork_count,
                  stargazer_count, watchers_count, pushed_at, created_at, is_archived, is_disabled,
-                 is_fork, license, primary_language, latest_commit_hash, last_updated_in_this_database)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_fork, license, primary_language, latest_commit_hash, last_updated_in_this_database,
+                 is_package, is_program, latest_release_version, dependents_count, owner_avatar_id, minimum_zig_version)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 owner = excluded.owner,
-                platform = excluded.platform,
+                platform_id = excluded.platform_id,
                 description = excluded.description,
                 issues_count = excluded.issues_count,
                 default_branch_name = excluded.default_branch_name,
@@ -366,20 +399,26 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
                 license = excluded.license,
                 primary_language = excluded.primary_language,
                 latest_commit_hash = excluded.latest_commit_hash,
-                last_updated_in_this_database = excluded.last_updated_in_this_database
+                last_updated_in_this_database = excluded.last_updated_in_this_database,
+                is_package = CASE WHEN excluded.is_package = 1 THEN 1 ELSE repos.is_package END,
+                is_program = CASE WHEN excluded.is_program = 1 THEN 1 ELSE repos.is_program END,
+                latest_release_version = COALESCE(excluded.latest_release_version, repos.latest_release_version),
+                dependents_count = repos.dependents_count,
+                owner_avatar_id = COALESCE(excluded.owner_avatar_id, repos.owner_avatar_id),
+                minimum_zig_version = COALESCE(excluded.minimum_zig_version, repos.minimum_zig_version)
             "#,
             params![
                 repo_id.clone(),
                 owner_id,
-                platform,
+                platform_id,
                 description,
                 repository.issues.total_count,
                 default_branch_name,
                 repository.fork_count,
                 repository.stargazer_count,
                 repository.watchers.total_count,
-                repository.pushed_at.clone(),
-                repository.created_at.clone(),
+                pushed_at_epoch,
+                created_at_epoch,
                 repository.is_archived,
                 repository.is_disabled,
                 repository.is_fork,
@@ -387,6 +426,12 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
                 primary_language,
                 latest_commit_hash,
                 database_updated_at,
+                is_package_flag,
+                is_program_flag,
+                latest_release_version,
+                0i64,
+                owner_avatar_id,
+                minimum_zig_version,
             ],
         ),
     );
@@ -444,49 +489,46 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
             .unwrap();
     }
 
-    let mut rows = transaction
-        .query(
+    let default_branch_version = truncate_to_char_limit(
+        "__ZIGISTRY__DEFAULT__BRANCH__",
+        limits::RELEASE_VERSION_MAX_LEN,
+    );
+
+    transaction
+        .execute(
             r#"
             INSERT INTO releases
-                (repo_id, version, is_prerelease, published_at, minimum_zig_version, readme_url, directory_files)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+                (repo_id, version, is_prerelease, published_at, minimum_zig_version, readme_url)
+            VALUES(?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo_id, version) DO UPDATE SET
                 is_prerelease = excluded.is_prerelease,
                 published_at = excluded.published_at,
                 minimum_zig_version = excluded.minimum_zig_version,
-                readme_url = excluded.readme_url,
-                directory_files = excluded.directory_files
-            RETURNING id
+                readme_url = excluded.readme_url
             "#,
             params![
                 repo_id.clone(),
-                truncate_to_char_limit(
-                    "__ZIGISTRY__DEFAULT__BRANCH__",
-                    limits::RELEASE_VERSION_MAX_LEN
-                ),
+                default_branch_version.clone(),
                 false,
-                repository.created_at.clone(),
-                truncate_to_char_limit(
-                    &build_zig_zon_version,
-                    limits::RELEASE_MIN_ZIG_VERSION_MAX_LEN
+                created_at_epoch,
+                truncate_option_to_char_limit(
+                    if build_zig_zon_version.is_empty() {
+                        None
+                    } else {
+                        Some(&build_zig_zon_version)
+                    },
+                    limits::RELEASE_MIN_ZIG_VERSION_MAX_LEN,
                 ),
                 readme_url.clone(),
-                truncate_to_char_limit(
-                    &default_branch_directory_files,
-                    limits::RELEASE_DIRECTORY_FILES_MAX_LEN
-                ),
             ],
         )
         .await
         .unwrap();
 
-    let default_branch_release_id: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-    drop(rows);
-
     transaction
         .execute(
-            "DELETE FROM release_dependencies WHERE release_id = ?",
-            params![default_branch_release_id],
+            "DELETE FROM release_dependencies WHERE repo_id = ? AND version = ?",
+            params![repo_id.clone(), default_branch_version.clone()],
         )
         .await
         .unwrap();
@@ -494,18 +536,19 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
     if !build_zig_zon_dependencies.is_empty() {
         let placeholders = build_zig_zon_dependencies
             .iter()
-            .map(|_| "(?, ?, ?, ?, ?, ?)")
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
 
         let sql = format!(
-            "INSERT INTO release_dependencies (release_id, name, hash, is_lazy, url, path) VALUES {}",
+            "INSERT INTO release_dependencies (repo_id, version, name, hash, is_lazy, url, path) VALUES {}",
             placeholders
         );
 
         let mut params_vec: Vec<libsql::Value> = Vec::new();
         for dependency in &build_zig_zon_dependencies {
-            params_vec.push(default_branch_release_id.into());
+            params_vec.push(repo_id.clone().into());
+            params_vec.push(default_branch_version.clone().into());
             params_vec.push(
                 truncate_to_char_limit(&dependency.name, limits::RELEASE_DEPENDENCY_FIELD_MAX_LEN)
                     .into(),
@@ -529,46 +572,45 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
     }
 
     for release_data in releases {
-        let mut rows = transaction
-            .query(
+        let release_version =
+            truncate_to_char_limit(&release_data.tag_name, limits::RELEASE_VERSION_MAX_LEN);
+        let release_published_at_epoch = parse_iso_to_epoch(&release_data.published_at);
+
+        transaction
+            .execute(
                 r#"
                 INSERT INTO releases
-                    (repo_id, version, is_prerelease, published_at, minimum_zig_version, readme_url, directory_files)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                    (repo_id, version, is_prerelease, published_at, minimum_zig_version, readme_url)
+                VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_id, version) DO UPDATE SET
                     is_prerelease = excluded.is_prerelease,
                     published_at = excluded.published_at,
                     minimum_zig_version = excluded.minimum_zig_version,
-                    readme_url = excluded.readme_url,
-                    directory_files = excluded.directory_files
-                RETURNING id
+                    readme_url = excluded.readme_url
                 "#,
                 params![
                     repo_id.clone(),
-                    truncate_to_char_limit(&release_data.tag_name, limits::RELEASE_VERSION_MAX_LEN),
+                    release_version.clone(),
                     release_data.is_prerelease,
-                    release_data.published_at,
-                    truncate_to_char_limit(
-                        &release_data.minimum_zig_version,
-                        limits::RELEASE_MIN_ZIG_VERSION_MAX_LEN
+                    release_published_at_epoch,
+                    truncate_option_to_char_limit(
+                        if release_data.minimum_zig_version.is_empty() {
+                            None
+                        } else {
+                            Some(&release_data.minimum_zig_version)
+                        },
+                        limits::RELEASE_MIN_ZIG_VERSION_MAX_LEN,
                     ),
                     release_data.readme_url,
-                    truncate_to_char_limit(
-                        &release_data.directory_files,
-                        limits::RELEASE_DIRECTORY_FILES_MAX_LEN
-                    ),
                 ],
             )
             .await
             .unwrap();
 
-        let this_specific_release_id: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        drop(rows);
-
         transaction
             .execute(
-                "DELETE FROM release_dependencies WHERE release_id = ?",
-                params![this_specific_release_id],
+                "DELETE FROM release_dependencies WHERE repo_id = ? AND version = ?",
+                params![repo_id.clone(), release_version.clone()],
             )
             .await
             .unwrap();
@@ -577,18 +619,19 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
             let placeholders = release_data
                 .dependencies
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?)")
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(", ");
 
             let sql = format!(
-                "INSERT INTO release_dependencies (release_id, name, hash, is_lazy, url, path) VALUES {}",
+                "INSERT INTO release_dependencies (repo_id, version, name, hash, is_lazy, url, path) VALUES {}",
                 placeholders
             );
 
             let mut params_vec: Vec<libsql::Value> = Vec::new();
             for dependency in &release_data.dependencies {
-                params_vec.push(this_specific_release_id.into());
+                params_vec.push(repo_id.clone().into());
+                params_vec.push(release_version.clone().into());
                 params_vec.push(
                     truncate_to_char_limit(
                         &dependency.name,
@@ -622,24 +665,6 @@ pub async fn persist_repo_data(transaction: &Transaction, data: RepoData) {
 
             transaction.execute(&sql, params_vec).await.unwrap();
         }
-    }
-
-    if is_package {
-        transaction
-            .execute(
-                r#"INSERT OR IGNORE INTO packages (repo_id) VALUES(?)"#,
-                params![repo_id],
-            )
-            .await
-            .unwrap();
-    } else {
-        transaction
-            .execute(
-                r#"INSERT OR IGNORE INTO programs (repo_id) VALUES(?)"#,
-                params![repo_id],
-            )
-            .await
-            .unwrap();
     }
 }
 
@@ -949,10 +974,17 @@ pub async fn process_query_range_partial_repo_query(
             if let Some(row) = existing_rows.next().await? {
                 let existing_commit_hash: String = row.get(0)?;
                 if existing_commit_hash != parsed.latest_commit_hash {
+                    let now_epoch = chrono::Utc::now().timestamp();
                     transaction
                         .execute(
-                            "INSERT OR IGNORE INTO needs_updates (id, type_of_repo) VALUES (?, ?)",
-                            params![parsed.repo_id, repo_type],
+                            r#"
+                            INSERT INTO repo_pipeline_queue (id, type_of_repo, status, queued_at)
+                            VALUES (?, ?, 'needs_update', ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                status = 'needs_update',
+                                queued_at = excluded.queued_at
+                            "#,
+                            params![parsed.repo_id, repo_type, now_epoch],
                         )
                         .await?;
                 }
@@ -961,7 +993,7 @@ pub async fn process_query_range_partial_repo_query(
 
             let mut banned_rows = transaction
                 .query(
-                    "SELECT 1 FROM banned_user_list WHERE id IN (?, ?) LIMIT 1",
+                    "SELECT 1 FROM banned_users WHERE id IN (?, ?) LIMIT 1",
                     params![parsed.owner_id, parsed.owner_login],
                 )
                 .await?;
@@ -970,10 +1002,15 @@ pub async fn process_query_range_partial_repo_query(
                 continue;
             }
 
+            let now_epoch = chrono::Utc::now().timestamp();
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO index_new_repo (id, type_of_repo) VALUES (?, ?)",
-                    params![parsed.repo_id, repo_type],
+                    r#"
+                    INSERT INTO repo_pipeline_queue (id, type_of_repo, status, queued_at)
+                    VALUES (?, ?, 'pending_check', ?)
+                    ON CONFLICT(id) DO NOTHING
+                    "#,
+                    params![parsed.repo_id, repo_type, now_epoch],
                 )
                 .await?;
         }
@@ -1210,7 +1247,7 @@ async fn fetch_with_retry(
 
 #[tokio::test]
 async fn test() {
-    let client = Client::new();
+    let client = reqwest::Client::new();
     let res = get_readme_url_and_content("zigistry", "zigistry", "main", true, &client).await;
     let url = res.0.unwrap();
 
